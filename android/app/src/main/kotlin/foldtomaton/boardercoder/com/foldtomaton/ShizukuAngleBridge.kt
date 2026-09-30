@@ -108,7 +108,7 @@ class ShizukuAngleBridge(
         .daemon(false)
         .processNameSuffix("angle_shell")
         .debuggable(true)
-        .version(1)
+        .version(2)
 
     private fun bind() {
         if (service != null || binding || !hasPermission) return

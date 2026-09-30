@@ -323,7 +323,9 @@ class _InstrumentScreenState extends ConsumerState<InstrumentScreen> {
                         await Future<void>.delayed(
                           const Duration(milliseconds: 500),
                         );
-                        dialogRef.invalidate(hingeStatusProvider);
+                        // Opening Shizuku or the wallpaper picker can dispose
+                        // this dialog while the platform call is still pending.
+                        if (mounted) ref.invalidate(hingeStatusProvider);
                       },
                 child: Text(actionLabel),
               ),
