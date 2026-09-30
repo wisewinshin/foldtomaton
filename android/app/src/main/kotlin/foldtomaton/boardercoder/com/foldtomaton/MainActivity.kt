@@ -1,10 +1,8 @@
 package foldtomaton.boardercoder.com.foldtomaton
 
-import android.content.Context
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
+import android.app.WallpaperManager
+import android.content.Intent
+import android.net.Uri
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
@@ -17,18 +15,25 @@ import kotlin.concurrent.thread
 import kotlin.math.PI
 import kotlin.math.exp
 import kotlin.math.max
+import kotlin.math.pow
 import kotlin.math.sin
 
-class MainActivity : FlutterActivity(), SensorEventListener {
-    private lateinit var sensorManager: SensorManager
-    private var hingeSensor: Sensor? = null
+class MainActivity : FlutterActivity() {
+    private lateinit var hingeSource: HingeAngleSource
+    private lateinit var shizukuFeed: ShizukuAngleFeed
+    private lateinit var tiltVibrato: TiltVibratoSource
     private var eventSink: EventChannel.EventSink? = null
+    private var vibratoSink: EventChannel.EventSink? = null
     private val synth = SynthEngine()
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        hingeSensor = sensorManager.getDefaultSensor(Sensor.TYPE_HINGE_ANGLE)
+        hingeSource = HingeAngleSource(this) { angle -> eventSink?.success(angle) }
+        shizukuFeed = ShizukuAngleFeed(this, hingeSource) { eventSink != null }
+        tiltVibrato = TiltVibratoSource(this) { cents ->
+            synth.updateVibrato(cents)
+            vibratoSink?.success(cents)
+        }
 
         EventChannel(
             flutterEngine.dartExecutor.binaryMessenger,
@@ -36,21 +41,33 @@ class MainActivity : FlutterActivity(), SensorEventListener {
         ).setStreamHandler(object : EventChannel.StreamHandler {
             override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
                 eventSink = events
-                val sensor = hingeSensor
-                if (sensor == null) {
-                    events.error("NO_HINGE_SENSOR", "TYPE_HINGE_ANGLE is unavailable", null)
+                if (!hingeSource.isAvailable) {
+                    events.error("NO_HINGE_SENSOR", "No hinge angle sensor is available", null)
                     return
                 }
-                sensorManager.registerListener(
-                    this@MainActivity,
-                    sensor,
-                    SensorManager.SENSOR_DELAY_GAME,
-                )
+                if (!hingeSource.start()) {
+                    events.error("HINGE_REGISTER_FAILED", "Hinge sensor registration failed", null)
+                }
+                shizukuFeed.startIfReady()
             }
 
             override fun onCancel(arguments: Any?) {
-                sensorManager.unregisterListener(this@MainActivity)
+                shizukuFeed.stop()
+                hingeSource.stop()
                 eventSink = null
+            }
+        })
+
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "foldtomaton/tilt_vibrato",
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                vibratoSink = events
+            }
+
+            override fun onCancel(arguments: Any?) {
+                vibratoSink = null
             }
         })
 
@@ -59,7 +76,14 @@ class MainActivity : FlutterActivity(), SensorEventListener {
             "foldtomaton/hinge",
         ).setMethodCallHandler { call, result ->
             when (call.method) {
-                "isAvailable" -> result.success(hingeSensor != null)
+                "isAvailable" -> result.success(hingeSource.isAvailable)
+                "getStatus" -> result.success(shizukuFeed.status())
+                "requestShizukuPermission" -> {
+                    result.success(shizukuFeed.bridge.requestPermission())
+                }
+                "retryContinuousAngle" -> result.success(shizukuFeed.startIfReady())
+                "openShizuku" -> result.success(openShizuku())
+                "chooseFoldWallpaper" -> result.success(chooseFoldWallpaper())
                 else -> result.notImplemented()
             }
         }
@@ -94,18 +118,51 @@ class MainActivity : FlutterActivity(), SensorEventListener {
         }
     }
 
-    override fun onSensorChanged(event: SensorEvent) {
-        if (event.sensor.type == Sensor.TYPE_HINGE_ANGLE) {
-            eventSink?.success(event.values[0].toDouble())
+    override fun onResume() {
+        super.onResume()
+        if (::shizukuFeed.isInitialized) {
+            shizukuFeed.bridge.refresh()
+            shizukuFeed.startIfReady()
         }
+        if (::tiltVibrato.isInitialized) tiltVibrato.start()
     }
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+    override fun onPause() {
+        if (::tiltVibrato.isInitialized) tiltVibrato.stop()
+        super.onPause()
+    }
+
+    private fun openShizuku(): Boolean = runCatching {
+        val launch = packageManager.getLaunchIntentForPackage(SHIZUKU_PACKAGE)
+        startActivity(
+            launch ?: Intent(
+                Intent.ACTION_VIEW,
+                Uri.parse("https://shizuku.rikka.app/download/"),
+            ),
+        )
+        true
+    }.getOrDefault(false)
+
+    private fun chooseFoldWallpaper(): Boolean = runCatching {
+        startActivity(
+            Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).putExtra(
+                WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT,
+                ShizukuAngleFeed.FOLD_WALLPAPER,
+            ),
+        )
+        true
+    }.getOrDefault(false)
 
     override fun onDestroy() {
-        if (::sensorManager.isInitialized) sensorManager.unregisterListener(this)
+        if (::tiltVibrato.isInitialized) tiltVibrato.stop()
+        if (::shizukuFeed.isInitialized) shizukuFeed.dispose()
+        if (::hingeSource.isInitialized) hingeSource.stop()
         synth.stop()
         super.onDestroy()
+    }
+
+    private companion object {
+        const val SHIZUKU_PACKAGE = "moe.shizuku.privileged.api"
     }
 }
 
@@ -119,6 +176,7 @@ private class SynthEngine {
     @Volatile private var cutoff = 8000.0
     // DSP gain only. This never reads or changes the Android media volume.
     @Volatile private var gain = 0.65
+    @Volatile private var vibratoCents = 0.0
     private var worker: Thread? = null
 
     @Synchronized
@@ -156,7 +214,8 @@ private class SynthEngine {
             track.play()
             try {
                 while (running.get()) {
-                    val localFrequency = frequency.coerceIn(20.0, 18000.0)
+                    val localFrequency = frequency.coerceIn(20.0, 18000.0) *
+                        2.0.pow(vibratoCents.coerceIn(-12.0, 12.0) / 1200.0)
                     val localCutoff = cutoff.coerceIn(50.0, 20000.0)
                     val localGain = gain.coerceIn(0.0, 1.0)
                     val phaseStep = 2.0 * PI * localFrequency / SAMPLE_RATE
@@ -185,6 +244,10 @@ private class SynthEngine {
         this.frequency = frequency
         this.cutoff = cutoff
         this.gain = gain
+    }
+
+    fun updateVibrato(cents: Double) {
+        vibratoCents = cents
     }
 
     @Synchronized

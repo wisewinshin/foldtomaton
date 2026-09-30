@@ -45,6 +45,18 @@ class _InstrumentScreenState extends ConsumerState<InstrumentScreen> {
   double _pinchGain = 0;
   double? _acceptedAngle;
   bool _pinching = false;
+  InstrumentValues? _latestValues;
+  bool _toneUpdatePending = false;
+  bool _toneUpdateDirty = false;
+  Timer? _statusTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _statusTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (mounted) ref.invalidate(hingeStatusProvider);
+    });
+  }
 
   double _applyTolerance(double raw) {
     final calibrated = (raw + _calibrationOffset).clamp(0, 180).toDouble();
@@ -55,28 +67,46 @@ class _InstrumentScreenState extends ConsumerState<InstrumentScreen> {
     return _acceptedAngle!;
   }
 
-  Future<void> _syncTone(InstrumentValues values) async {
-    if (!_pinching) return;
-    await ref
-        .read(audioServiceProvider)
-        .updateTone(
-          frequency: values.frequency,
-          cutoff: values.filterCutoff,
-          gain: _pinchGain,
-        );
+  void _queueToneUpdate() {
+    if (!_pinching || _latestValues == null) return;
+    _toneUpdateDirty = true;
+    if (_toneUpdatePending) return;
+    _toneUpdatePending = true;
+    unawaited(_flushToneUpdates());
   }
 
-  Future<void> _setPinching(bool active, InstrumentValues values) async {
+  Future<void> _flushToneUpdates() async {
+    while (mounted && _pinching && _toneUpdateDirty) {
+      _toneUpdateDirty = false;
+      final values = _latestValues!;
+      final gain = _pinchGain;
+      await ref
+          .read(audioServiceProvider)
+          .updateTone(
+            frequency: values.frequency,
+            cutoff: values.filterCutoff,
+            gain: gain,
+          );
+    }
+    _toneUpdatePending = false;
+    if (mounted && _pinching && _toneUpdateDirty) _queueToneUpdate();
+  }
+
+  Future<void> _setPinching(bool active) async {
     if (_pinching == active) return;
     _pinching = active;
     final audio = ref.read(audioServiceProvider);
     if (active) {
+      final values = _latestValues;
+      if (values == null) return;
       await audio.startTone(
         frequency: values.frequency,
         cutoff: values.filterCutoff,
         gain: _pinchGain,
       );
+      _queueToneUpdate();
     } else {
+      _toneUpdateDirty = false;
       await audio.stopTone();
     }
     if (mounted) setState(() {});
@@ -91,7 +121,13 @@ class _InstrumentScreenState extends ConsumerState<InstrumentScreen> {
         ? sensorAngle
         : _simulatedAngle;
     final values = AngleMapper.map(_applyTolerance(rawAngle));
-    unawaited(_syncTone(values));
+    final vibratoCents = ref.watch(tiltVibratoProvider).valueOrNull ?? 0;
+    final pitchChanged =
+        _latestValues == null ||
+        (_latestValues!.frequency - values.frequency).abs() > 0.001 ||
+        (_latestValues!.filterCutoff - values.filterCutoff).abs() > 0.001;
+    _latestValues = values;
+    if (pitchChanged) _queueToneUpdate();
 
     return Scaffold(
       body: SafeArea(
@@ -105,8 +141,18 @@ class _InstrumentScreenState extends ConsumerState<InstrumentScreen> {
                   Expanded(
                     flex: 7,
                     child: isPortrait
-                        ? _portraitInstrument(values, rawAngle, hasSensor)
-                        : _landscapeInstrument(values, rawAngle, hasSensor),
+                        ? _portraitInstrument(
+                            values,
+                            rawAngle,
+                            hasSensor,
+                            vibratoCents,
+                          )
+                        : _landscapeInstrument(
+                            values,
+                            rawAngle,
+                            hasSensor,
+                            vibratoCents,
+                          ),
                   ),
                   const SizedBox(height: 10),
                   Expanded(
@@ -116,10 +162,10 @@ class _InstrumentScreenState extends ConsumerState<InstrumentScreen> {
                       sounding: _pinching,
                       onGainChanged: (gain) {
                         setState(() => _pinchGain = gain);
-                        unawaited(_syncTone(values));
+                        _queueToneUpdate();
                       },
                       onInteractionChanged: (active) =>
-                          unawaited(_setPinching(active, values)),
+                          unawaited(_setPinching(active)),
                     ),
                   ),
                 ],
@@ -135,6 +181,7 @@ class _InstrumentScreenState extends ConsumerState<InstrumentScreen> {
     InstrumentValues values,
     double rawAngle,
     bool hasSensor,
+    double vibratoCents,
   ) {
     return _InstrumentShell(
       child: Column(
@@ -145,7 +192,7 @@ class _InstrumentScreenState extends ConsumerState<InstrumentScreen> {
               children: [
                 _verticalPitchRail(values.normalized),
                 const SizedBox(width: 20),
-                Expanded(child: _readout(values)),
+                Expanded(child: _readout(values, vibratoCents)),
               ],
             ),
           ),
@@ -159,6 +206,7 @@ class _InstrumentScreenState extends ConsumerState<InstrumentScreen> {
     InstrumentValues values,
     double rawAngle,
     bool hasSensor,
+    double vibratoCents,
   ) {
     return _InstrumentShell(
       child: Row(
@@ -173,7 +221,7 @@ class _InstrumentScreenState extends ConsumerState<InstrumentScreen> {
             ),
           ),
           const SizedBox(width: 24),
-          Expanded(child: _readout(values)),
+          Expanded(child: _readout(values, vibratoCents)),
           const SizedBox(width: 24),
           SizedBox(width: 250, child: _controls(rawAngle, hasSensor)),
         ],
@@ -182,6 +230,8 @@ class _InstrumentScreenState extends ConsumerState<InstrumentScreen> {
   }
 
   Widget _header(bool hasSensor, {bool compact = false}) {
+    final hingeStatus = ref.watch(hingeStatusProvider).valueOrNull;
+    final continuous = hingeStatus?.continuous == true;
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
@@ -190,12 +240,97 @@ class _InstrumentScreenState extends ConsumerState<InstrumentScreen> {
             'FOLDTOMATON',
             style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 2),
           ),
-        Chip(
+        ActionChip(
           padding: compact ? EdgeInsets.zero : null,
-          avatar: Icon(hasSensor ? Icons.sensors : Icons.tune, size: 16),
-          label: Text(hasSensor ? 'HINGE' : 'SIM'),
+          avatar: Icon(
+            continuous
+                ? Icons.graphic_eq
+                : hasSensor
+                ? Icons.sensors
+                : Icons.tune,
+            size: 16,
+          ),
+          label: Text(
+            continuous
+                ? 'CONTINUOUS'
+                : hasSensor
+                ? 'HINGE'
+                : 'SIM',
+          ),
+          onPressed: _showHingeSetup,
         ),
       ],
+    );
+  }
+
+  Future<void> _showHingeSetup() async {
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => Consumer(
+        builder: (context, dialogRef, _) {
+          final asyncStatus = dialogRef.watch(hingeStatusProvider);
+          final status = asyncStatus.valueOrNull;
+          final service = dialogRef.read(hingeAngleServiceProvider);
+
+          String message;
+          Future<bool> Function()? action;
+          String actionLabel;
+          if (status == null) {
+            message = '연속 각도 환경을 확인하고 있습니다.';
+            actionLabel = '확인 중';
+          } else if (!status.installed) {
+            message = '연속 각도에는 Shizuku가 필요합니다. 설치한 뒤 앱에서 실행 상태를 만들어 주세요.';
+            action = service.openShizuku;
+            actionLabel = 'Shizuku 설치';
+          } else if (!status.running) {
+            message =
+                'Shizuku가 설치되어 있지만 실행 중이 아닙니다. 무선 디버깅 또는 PC로 Shizuku를 시작하세요.';
+            action = service.openShizuku;
+            actionLabel = 'Shizuku 열기';
+          } else if (!status.authorized) {
+            message = 'Foldtomaton이 Shizuku user-service를 사용할 수 있도록 권한을 허용하세요.';
+            action = service.requestShizukuPermission;
+            actionLabel = '권한 허용';
+          } else if (!status.wallpaper) {
+            message =
+                '삼성 Fold Interactive 라이브 배경화면을 홈 배경화면으로 지정해야 실제 각도를 읽을 수 있습니다.';
+            action = service.chooseFoldWallpaper;
+            actionLabel = '배경화면 선택';
+          } else if (!status.continuous) {
+            message =
+                '연결은 준비됐지만 아직 연속 각도 이벤트가 없습니다. 다시 연결한 뒤 폰을 움직여 보세요.\nReader: ${status.reader}';
+            action = service.retryContinuousAngle;
+            actionLabel = '다시 연결';
+          } else {
+            message = '연속 힌지 각도를 받고 있습니다.\n수신 이벤트: ${status.parsed}';
+            action = service.retryContinuousAngle;
+            actionLabel = '연결 확인';
+          }
+
+          return AlertDialog(
+            title: const Text('연속 힌지 각도'),
+            content: Text(message),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(),
+                child: const Text('닫기'),
+              ),
+              FilledButton(
+                onPressed: action == null
+                    ? null
+                    : () async {
+                        await action!();
+                        await Future<void>.delayed(
+                          const Duration(milliseconds: 500),
+                        );
+                        dialogRef.invalidate(hingeStatusProvider);
+                      },
+                child: Text(actionLabel),
+              ),
+            ],
+          );
+        },
+      ),
     );
   }
 
@@ -286,7 +421,7 @@ class _InstrumentScreenState extends ConsumerState<InstrumentScreen> {
     );
   }
 
-  Widget _readout(InstrumentValues values) {
+  Widget _readout(InstrumentValues values, double vibratoCents) {
     return Column(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
@@ -306,6 +441,18 @@ class _InstrumentScreenState extends ConsumerState<InstrumentScreen> {
         Text(
           '${values.frequency.toStringAsFixed(1)} Hz',
           style: const TextStyle(color: Colors.white60, fontSize: 16),
+        ),
+        const SizedBox(height: 3),
+        Text(
+          'TILT VIBRATO ${vibratoCents >= 0 ? '+' : ''}${vibratoCents.toStringAsFixed(1)} ct',
+          style: TextStyle(
+            color: vibratoCents.abs() >= 0.4
+                ? const Color(0xFFFF8FA3)
+                : Colors.white38,
+            fontSize: 12,
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0.7,
+          ),
         ),
         const SizedBox(height: 14),
         const Text(
@@ -371,6 +518,7 @@ class _InstrumentScreenState extends ConsumerState<InstrumentScreen> {
 
   @override
   void dispose() {
+    _statusTimer?.cancel();
     unawaited(ref.read(audioServiceProvider).stopTone());
     super.dispose();
   }
@@ -419,11 +567,13 @@ class _PinchMouthState extends State<_PinchMouth> {
   void _updatePointer(int pointer, Offset position, double width) {
     _pointers[pointer] = position;
     final pinching = _pointers.length >= 2;
-    if (pinching != _wasPinching) {
-      _wasPinching = pinching;
-      widget.onInteractionChanged(pinching);
+    if (!pinching) {
+      if (_wasPinching) {
+        _wasPinching = false;
+        widget.onInteractionChanged(false);
+      }
+      return;
     }
-    if (!pinching) return;
 
     final points = _pointers.values.take(2).toList();
     final distance = (points[0] - points[1]).distance;
@@ -431,7 +581,12 @@ class _PinchMouthState extends State<_PinchMouth> {
     final far = (width * 0.75).clamp(120.0, 520.0);
     final gain = (1 - ((distance - near) / (far - near))).clamp(0.0, 1.0);
     setState(() => _distance = distance);
+    // Start playback only after the first valid two-finger gain is available.
     widget.onGainChanged(gain);
+    if (!_wasPinching) {
+      _wasPinching = true;
+      widget.onInteractionChanged(true);
+    }
   }
 
   void _removePointer(int pointer) {
